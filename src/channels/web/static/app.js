@@ -1,5 +1,69 @@
 // IronClaw Web Gateway - Client
 
+// --- Theme Management (dark / light / system) ---
+// Icon switching is handled by pure CSS via data-theme-mode on <html>.
+
+function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+const VALID_THEME_MODES = { dark: true, light: true, system: true };
+
+function getThemeMode() {
+  const stored = localStorage.getItem('ironclaw-theme');
+  return (stored && VALID_THEME_MODES[stored]) ? stored : 'system';
+}
+
+function resolveTheme(mode) {
+  return mode === 'system' ? getSystemTheme() : mode;
+}
+
+function applyTheme(mode) {
+  const resolved = resolveTheme(mode);
+  document.documentElement.setAttribute('data-theme', resolved);
+  document.documentElement.setAttribute('data-theme-mode', mode);
+  const titleKeys = { dark: 'theme.tooltipDark', light: 'theme.tooltipLight', system: 'theme.tooltipSystem' };
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.title = (typeof I18n !== 'undefined' && titleKeys[mode]) ? I18n.t(titleKeys[mode]) : ('Theme: ' + mode);
+  const announce = document.getElementById('theme-announce');
+  if (announce) announce.textContent = (typeof I18n !== 'undefined') ? I18n.t('theme.announce', { mode: mode }) : ('Theme: ' + mode);
+}
+
+function toggleTheme() {
+  const cycle = { dark: 'light', light: 'system', system: 'dark' };
+  const current = getThemeMode();
+  const next = cycle[current] || 'dark';
+  localStorage.setItem('ironclaw-theme', next);
+  applyTheme(next);
+}
+
+// Apply theme immediately (FOUC prevention is done via inline script in <head>,
+// but we call again here to ensure tooltip is set after DOM is ready).
+applyTheme(getThemeMode());
+
+// Delay enabling theme transition to avoid flash on initial load.
+requestAnimationFrame(function() {
+  requestAnimationFrame(function() {
+    document.body.classList.add('theme-transition');
+  });
+});
+
+// Listen for OS theme changes — only re-apply when in 'system' mode.
+const mql = window.matchMedia('(prefers-color-scheme: light)');
+const onSchemeChange = function() {
+  if (getThemeMode() === 'system') {
+    applyTheme('system');
+  }
+};
+if (mql.addEventListener) {
+  mql.addEventListener('change', onSchemeChange);
+} else if (mql.addListener) {
+  mql.addListener(onSchemeChange);
+}
+
+// Bind theme toggle button (CSP-compliant — no inline onclick).
+document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+
 let token = '';
 let eventSource = null;
 let logEventSource = null;
@@ -99,6 +163,30 @@ function authenticate() {
 document.getElementById('token-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
 });
+
+// --- Static element event bindings (CSP-compliant, no inline handlers) ---
+document.getElementById('auth-connect-btn').addEventListener('click', () => authenticate());
+document.getElementById('restart-overlay').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-close-btn').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-cancel-btn').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-confirm-btn').addEventListener('click', () => confirmRestart());
+document.getElementById('language-btn').addEventListener('click', () => toggleLanguageMenu());
+// Language option clicks handled by delegated data-action="switch-language" handler.
+document.getElementById('restart-btn').addEventListener('click', () => triggerRestart());
+document.getElementById('thread-new-btn').addEventListener('click', () => createNewThread());
+document.getElementById('thread-toggle-btn').addEventListener('click', () => toggleThreadSidebar());
+document.getElementById('assistant-thread').addEventListener('click', () => switchToAssistant());
+document.getElementById('send-btn').addEventListener('click', () => sendMessage());
+document.getElementById('memory-edit-btn').addEventListener('click', () => startMemoryEdit());
+document.getElementById('memory-save-btn').addEventListener('click', () => saveMemoryEdit());
+document.getElementById('memory-cancel-btn').addEventListener('click', () => cancelMemoryEdit());
+document.getElementById('logs-server-level').addEventListener('change', function() { setServerLogLevel(this.value); });
+document.getElementById('logs-pause-btn').addEventListener('click', () => toggleLogsPause());
+document.getElementById('logs-clear-btn').addEventListener('click', () => clearLogs());
+document.getElementById('wasm-install-btn').addEventListener('click', () => installWasmExtension());
+document.getElementById('mcp-add-btn').addEventListener('click', () => addMcpServer());
+document.getElementById('skill-search-btn').addEventListener('click', () => searchClawHub());
+document.getElementById('skill-install-btn').addEventListener('click', () => installSkillFromForm());
 
 // Auto-authenticate from URL param or saved session
 (function autoAuth() {
@@ -1138,18 +1226,19 @@ function showApproval(data) {
   approveBtn.textContent = I18n.t('approval.approve');
   approveBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'approve'));
 
-  const alwaysBtn = document.createElement('button');
-  alwaysBtn.className = 'always';
-  alwaysBtn.textContent = I18n.t('approval.always');
-  alwaysBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'always'));
-
   const denyBtn = document.createElement('button');
   denyBtn.className = 'deny';
   denyBtn.textContent = I18n.t('approval.deny');
   denyBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'deny'));
 
   actions.appendChild(approveBtn);
-  actions.appendChild(alwaysBtn);
+  if (data.allow_always !== false) {
+    const alwaysBtn = document.createElement('button');
+    alwaysBtn.className = 'always';
+    alwaysBtn.textContent = I18n.t('approval.always');
+    alwaysBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'always'));
+    actions.appendChild(alwaysBtn);
+  }
   actions.appendChild(denyBtn);
   card.appendChild(actions);
 
@@ -3854,6 +3943,17 @@ function renderRoutineDetail(routine) {
   }
 
   // Action config
+  if (routine.full_job_permissions) {
+    html += '<div class="job-description"><h3>Full Job Permissions</h3>'
+      + '<div class="job-meta-grid">'
+      + metaItem('Mode', routine.full_job_permissions.permission_mode)
+      + metaItem('Owner Default', routine.full_job_permissions.default_permission_mode)
+      + metaItem('Inherited Tools', (routine.full_job_permissions.owner_allowed_tools || []).join(', ') || '-')
+      + metaItem('Stored Tools', (routine.full_job_permissions.stored_tool_permissions || []).join(', ') || '-')
+      + metaItem('Effective Tools', (routine.full_job_permissions.effective_tool_permissions || []).join(', ') || '-')
+      + '</div></div>';
+  }
+
   html += '<div class="job-description"><h3>Action</h3>'
     + '<pre class="action-json">' + escapeHtml(JSON.stringify(routine.action, null, 2)) + '</pre></div>';
 
@@ -4688,6 +4788,10 @@ var AGENT_SETTINGS = [
     settings: [
       { key: 'routines.max_concurrent', label: 'cfg.routines_max_concurrent.label', description: 'cfg.routines_max_concurrent.desc', type: 'number', min: 0 },
       { key: 'routines.default_cooldown_secs', label: 'cfg.routines_cooldown.label', description: 'cfg.routines_cooldown.desc', type: 'number', min: 0 },
+      { key: 'routines.full_job_default_permission_mode', label: 'cfg.routines_full_job_default_mode.label', description: 'cfg.routines_full_job_default_mode.desc',
+        type: 'select', options: ['inherit_owner', 'explicit', 'copy_owner'] },
+      { key: 'routines.full_job_owner_allowed_tools', label: 'cfg.routines_full_job_owner_tools.label', description: 'cfg.routines_full_job_owner_tools.desc',
+        type: 'list', placeholder: 'shell, http' },
     ]
   },
   {
@@ -4872,7 +4976,14 @@ function renderStructuredSettingsRow(def, value, activeValue) {
   inputWrap.style.gap = '8px';
 
   var ariaLabel = I18n.t(def.label) + (def.description ? '. ' + I18n.t(def.description) : '');
-  var placeholderText = activeValue ? I18n.t('settings.envValue', { value: activeValue }) : (def.placeholder || I18n.t('settings.envDefault'));
+  function formatSettingValue(raw) {
+    if (Array.isArray(raw)) return raw.join(', ');
+    if (raw === null || raw === undefined) return '';
+    return String(raw);
+  }
+
+  var activeValueText = formatSettingValue(activeValue);
+  var placeholderText = activeValueText ? I18n.t('settings.envValue', { value: activeValueText }) : (def.placeholder || I18n.t('settings.envDefault'));
 
   if (def.type === 'boolean') {
     var boolSel = document.createElement('select');
@@ -4944,6 +5055,26 @@ function renderStructuredSettingsRow(def, value, activeValue) {
       };
     })(def.key, numInp));
     inputWrap.appendChild(numInp);
+  } else if (def.type === 'list') {
+    var listInp = document.createElement('input');
+    listInp.type = 'text';
+    listInp.className = 'settings-input';
+    listInp.setAttribute('aria-label', ariaLabel);
+    var listValue = '';
+    if (Array.isArray(value)) listValue = value.join(', ');
+    else if (typeof value === 'string') listValue = value;
+    listInp.value = listValue;
+    if (!listValue) listInp.placeholder = placeholderText;
+    listInp.addEventListener('change', (function(k, el) {
+      return function() {
+        if (el.value.trim() === '') return saveSetting(k, null);
+        var items = el.value.split(/[\n,]/).map(function(item) {
+          return item.trim();
+        }).filter(Boolean);
+        saveSetting(k, items);
+      };
+    })(def.key, listInp));
+    inputWrap.appendChild(listInp);
   } else {
     var textInp = document.createElement('input');
     textInp.type = 'text';
