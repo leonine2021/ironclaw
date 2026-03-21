@@ -147,6 +147,8 @@ struct DiscordRuntimeConfig {
     dm_policy: String,
     #[serde(default)]
     allow_from: Vec<String>,
+    #[serde(default)]
+    always_respond_channels: Vec<String>,
 }
 
 fn default_poll_interval_ms() -> u32 {
@@ -171,6 +173,7 @@ fn default_runtime_config() -> DiscordRuntimeConfig {
         owner_id: None,
         dm_policy: default_dm_policy(),
         allow_from: Vec::new(),
+        always_respond_channels: Vec::new(),
     }
 }
 
@@ -525,7 +528,7 @@ fn poll_for_mentions() {
     };
 
     for channel_id in &config.mention_channel_ids {
-        poll_channel_mentions(channel_id, &bot_id);
+        poll_channel_mentions(channel_id, &bot_id, &config);
     }
 }
 
@@ -556,7 +559,7 @@ fn get_or_fetch_bot_id() -> Option<String> {
     Some(id)
 }
 
-fn poll_channel_mentions(channel_id: &str, bot_id: &str) {
+fn poll_channel_mentions(channel_id: &str, bot_id: &str, config: &DiscordRuntimeConfig) {
     let cursor_path = format!("cursor_{}.txt", channel_id);
     let last_seen = channel_host::workspace_read(&cursor_path).map(|s| s.trim().to_string());
 
@@ -592,7 +595,7 @@ fn poll_channel_mentions(channel_id: &str, bot_id: &str) {
             continue;
         }
 
-        if !message_mentions_bot(&msg, bot_id) {
+        if !message_mentions_bot(&msg, bot_id) && !config.always_respond_channels.contains(&channel_id.to_string()) {
             continue;
         }
 

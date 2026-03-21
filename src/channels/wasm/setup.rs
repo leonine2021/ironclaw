@@ -128,7 +128,7 @@ async fn register_channel(
     let sig_key_secret_name = loaded.signature_key_secret_name();
     let hmac_secret_name = loaded.hmac_secret_name();
 
-    let webhook_secret = if let Some(secrets) = secrets_store {
+    let mut webhook_secret = if let Some(secrets) = secrets_store {
         secrets
             .get_decrypted(&config.owner_id, &secret_name)
             .await
@@ -137,6 +137,34 @@ async fn register_channel(
     } else {
         None
     };
+
+    // Fall back to signature or hmac key names if the primary webhook secret
+    // name yields no result. This ensures that channels using signature
+    // verification (like Discord) still have the correct key injected into
+    // their runtime config when loaded at startup.
+    if webhook_secret.is_none() {
+        if let Some(ref sig_key_name) = sig_key_secret_name {
+            if let Some(secrets) = secrets_store {
+                webhook_secret = secrets
+                    .get_decrypted(&config.owner_id, sig_key_name)
+                    .await
+                    .ok()
+                    .map(|s| s.expose().to_string());
+            }
+        }
+    }
+
+    if webhook_secret.is_none() {
+        if let Some(ref hmac_key_name) = hmac_secret_name {
+            if let Some(secrets) = secrets_store {
+                webhook_secret = secrets
+                    .get_decrypted(&config.owner_id, hmac_key_name)
+                    .await
+                    .ok()
+                    .map(|s| s.expose().to_string());
+            }
+        }
+    }
 
     let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
 

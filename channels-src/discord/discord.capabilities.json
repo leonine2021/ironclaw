@@ -59,6 +59,7 @@
     "polling_enabled": false,
     "poll_interval_ms": 30000,
     "mention_channel_ids": [],
+    "always_respond_channels": [],
     "owner_id": null,
     "dm_policy": "pairing",
     "allow_from": []

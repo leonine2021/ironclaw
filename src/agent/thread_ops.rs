@@ -9,13 +9,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
+use crate::agent::{Agent, MessageIntent};
 use crate::channels::web::util::truncate_preview;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
@@ -208,6 +208,27 @@ impl Agent {
             "Checked thread state"
         );
 
+        // Determine effective content by running through the router first
+        // this allows slash commands like /ask yes to be treated as "yes"
+        let temp_message = IncomingMessage {
+            content: content.to_string(),
+            ..message.clone()
+        };
+
+        let mut effective_content = content.to_string();
+        let mut command_intent = None;
+
+        if let Some(intent) = self.router.route_command(&temp_message) {
+            match intent {
+                MessageIntent::Chat { content: chat_content } => {
+                    effective_content = chat_content;
+                }
+                _ => {
+                    command_intent = Some(intent);
+                }
+            }
+        }
+
         // Check thread state
         match thread_state {
             ThreadState::Processing => {
@@ -221,18 +242,35 @@ impl Agent {
                 ));
             }
             ThreadState::AwaitingApproval => {
-                tracing::warn!(
-                    message_id = %message.id,
-                    thread_id = %thread_id,
-                    "Thread awaiting approval, rejecting new input"
-                );
-                let msg = match approval_context {
-                    Some((tool_name, desc_preview)) => format!(
-                        "Waiting for approval: {tool_name} — {desc_preview}. Use /interrupt to cancel."
-                    ),
-                    None => "Waiting for approval. Use /interrupt to cancel.".to_string(),
-                };
-                return Ok(SubmissionResult::pending(msg));
+                // Before rejecting, check if the effective content is an approval response
+                let lower = effective_content.trim().to_lowercase();
+                match lower.as_str() {
+                    "yes" | "y" | "approve" | "ok" | "yes!" | "yep" | "yeah" => {
+                        return self
+                            .process_approval(message, session, thread_id, None, true, false)
+                            .await;
+                    }
+                    "no" | "n" | "deny" | "reject" | "stop" | "cancel" | "nope" => {
+                        return self
+                            .process_approval(message, session, thread_id, None, false, false)
+                            .await;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            message_id = %message.id,
+                            thread_id = %thread_id,
+                            effective_content = %effective_content,
+                            "Thread awaiting approval, rejecting new input"
+                        );
+                        let msg = match approval_context {
+                            Some((tool_name, desc_preview)) => format!(
+                                "Waiting for approval: {tool_name} — {desc_preview}. Use /interrupt to cancel."
+                            ),
+                            None => "Waiting for approval. Use /interrupt to cancel.".to_string(),
+                        };
+                        return Ok(SubmissionResult::pending(msg));
+                    }
+                }
             }
             ThreadState::Completed => {
                 tracing::warn!(
@@ -249,8 +287,13 @@ impl Agent {
             }
         }
 
-        // Safety validation for user input
-        let validation = self.safety().validate_input(content);
+        // Handle explicit commands (non-chat)
+        if let Some(intent) = command_intent {
+            return self.handle_job_or_command(intent, message).await;
+        }
+
+        // Safety validation for user input using effective content
+        let validation = self.safety().validate_input(&effective_content);
         if !validation.is_valid {
             let details = validation
                 .errors
@@ -264,7 +307,7 @@ impl Agent {
             )));
         }
 
-        let violations = self.safety().check_policy(content);
+        let violations = self.safety().check_policy(&effective_content);
         if violations
             .iter()
             .any(|rule| rule.action == crate::safety::PolicyAction::Block)
@@ -272,10 +315,8 @@ impl Agent {
             return Ok(SubmissionResult::error("Input rejected by safety policy."));
         }
 
-        // Scan inbound messages for secrets (API keys, tokens).
-        // Catching them here prevents the LLM from echoing them back, which
-        // would trigger the outbound leak detector and create error loops.
-        if let Some(warning) = self.safety().scan_inbound_for_secrets(content) {
+        // Scan inbound messages for secrets (API keys, tokens) using effective content.
+        if let Some(warning) = self.safety().scan_inbound_for_secrets(&effective_content) {
             tracing::warn!(
                 user = %message.user_id,
                 channel = %message.channel,
@@ -284,17 +325,7 @@ impl Agent {
             return Ok(SubmissionResult::error(warning));
         }
 
-        // Handle explicit commands (starting with /) directly
-        // Everything else goes through the normal agentic loop with tools
-        let temp_message = IncomingMessage {
-            content: content.to_string(),
-            ..message.clone()
-        };
-
-        if let Some(intent) = self.router.route_command(&temp_message) {
-            // Explicit command like /status, /job, /list - handle directly
-            return self.handle_job_or_command(intent, message).await;
-        }
+        // Handle explicit commands handled already above
 
         // Natural language goes through the agentic loop
         // Job tools (create_job, list_jobs, etc.) are in the tool registry
@@ -354,10 +385,10 @@ impl Agent {
 
         // Augment content with attachment context (transcripts, metadata, images)
         let augmented =
-            crate::agent::attachments::augment_with_attachments(content, &message.attachments);
-        let (effective_content, image_parts) = match &augmented {
+            crate::agent::attachments::augment_with_attachments(&effective_content, &message.attachments);
+        let (final_content, image_parts) = match &augmented {
             Some(result) => (result.text.as_str(), result.image_parts.clone()),
-            None => (content, Vec::new()),
+            None => (effective_content.as_str(), Vec::new()),
         };
 
         // Start the turn and get messages
@@ -367,7 +398,7 @@ impl Agent {
                 .threads
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            let turn = thread.start_turn(effective_content);
+            let turn = thread.start_turn(final_content);
             turn.image_content_parts = image_parts;
             thread.messages()
         };
@@ -382,7 +413,7 @@ impl Agent {
             thread_id,
             &message.channel,
             &message.user_id,
-            effective_content,
+            final_content,
         )
         .await;
 

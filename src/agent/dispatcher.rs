@@ -1056,7 +1056,10 @@ fn strip_internal_tool_call_text(text: &str) -> String {
     if result.is_empty() {
         "I wasn't able to complete that request. Could you try rephrasing or providing more details?".to_string()
     } else {
-        result.to_string()
+        // Gemini and some other providers might HTML-escape special characters
+        // in Markdown links (e.g. converting & to &amp;), which breaks URLs like
+        // OAuth auth links. Decode common entities to restore functionality.
+        result.replace("&amp;", "&")
     }
 }
 

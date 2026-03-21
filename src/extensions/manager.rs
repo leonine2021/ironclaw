@@ -3691,13 +3691,28 @@ impl ExtensionManager {
         let sig_key_secret_name = loaded.signature_key_secret_name();
         let hmac_secret_name = loaded.hmac_secret_name();
 
-        // Get webhook secret from secrets store
-        let webhook_secret = self
+        // Get webhook secret from secrets store, falling back to signature or hmac key
+        // names if the primary webhook secret name yields no result. This ensures
+        // that channels using signature verification (like Discord) still have
+        // the correct key injected into their runtime config.
+        let mut webhook_secret = self
             .secrets
             .get_decrypted(&self.user_id, &webhook_secret_name)
             .await
             .ok()
             .map(|s| s.expose().to_string());
+        
+        if webhook_secret.is_none() {
+            if let Some(ref sig_key_name) = sig_key_secret_name {
+                webhook_secret = self.secrets.get_decrypted(&self.user_id, sig_key_name).await.ok().map(|s| s.expose().to_string());
+            }
+        }
+        
+        if webhook_secret.is_none() {
+            if let Some(ref hmac_key_name) = hmac_secret_name {
+                webhook_secret = self.secrets.get_decrypted(&self.user_id, hmac_key_name).await.ok().map(|s| s.expose().to_string());
+            }
+        }
 
         let channel_arc = Arc::new(loaded.channel.with_owner_actor_id(owner_actor_id));
 

@@ -332,13 +332,12 @@ async fn webhook_handler(
     );
 
     let channel_name = channel.channel_name();
+    let mut secret_validated = false;
+    let mut validation_error: Option<(StatusCode, String)> = None;
 
-    // Check if secret is required
+    // 1. Check if secret header is required/provided
     if state.router.requires_secret(channel_name).await {
-        // Get the secret header name for this channel (from capabilities or default)
         let secret_header_name = state.router.get_secret_header(channel_name).await;
-
-        // Try to get secret from query param or the channel's configured header
         let provided_secret = query
             .get("secret")
             .cloned()
@@ -349,7 +348,6 @@ async fn webhook_handler(
                     .map(|s| s.to_string())
             })
             .or_else(|| {
-                // Fallback to generic header if different from configured
                 if secret_header_name != "X-Webhook-Secret" {
                     headers
                         .get("X-Webhook-Secret")
@@ -360,45 +358,35 @@ async fn webhook_handler(
                 }
             });
 
-        tracing::debug!(
-            channel = %channel_name,
-            has_provided_secret = provided_secret.is_some(),
-            provided_secret_len = provided_secret.as_ref().map(|s| s.len()),
-            "Checking webhook secret"
-        );
-
         match provided_secret {
             Some(secret) => {
-                if !state.router.validate_secret(channel_name, &secret).await {
-                    tracing::warn!(
-                        channel = %channel_name,
-                        "Webhook secret validation failed"
-                    );
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "error": "Invalid webhook secret"
-                        })),
-                    );
+                if state.router.validate_secret(channel_name, &secret).await {
+                    tracing::debug!(channel = %channel_name, "Webhook secret validated");
+                    secret_validated = true;
+                } else {
+                    tracing::warn!(channel = %channel_name, "Webhook secret validation failed");
+                    validation_error = Some((StatusCode::UNAUTHORIZED, "Invalid webhook secret".to_string()));
                 }
-                tracing::debug!(channel = %channel_name, "Webhook secret validated");
             }
             None => {
-                tracing::warn!(
-                    channel = %channel_name,
-                    "Webhook secret required but not provided"
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": "Webhook secret required"
-                    })),
-                );
+                // Secret required but not provided - only an error if no other validation is available
+                let has_sig = state.router.get_signature_key(channel_name).await.is_some();
+                let has_hmac = state.router.get_hmac_secret(channel_name).await.is_some();
+                
+                if !has_sig && !has_hmac {
+                    tracing::warn!(channel = %channel_name, "Webhook secret required but not provided");
+                    validation_error = Some((StatusCode::UNAUTHORIZED, "Webhook secret required".to_string()));
+                }
             }
         }
     }
 
-    // Ed25519 signature verification (Discord-style)
+    // Return if primary secret check failed (and no other validation is available)
+    if let Some((status, err)) = validation_error {
+        return (status, Json(serde_json::json!({ "error": err })));
+    }
+
+    // 2. Ed25519 signature verification (Discord-style)
     if let Some(pub_key_hex) = state.router.get_signature_key(channel_name).await {
         let sig_hex = headers
             .get("x-signature-ed25519")
@@ -414,42 +402,31 @@ async fn webhook_handler(
                     .unwrap_or_default()
                     .as_secs() as i64;
 
-                if !crate::channels::wasm::signature::verify_discord_signature(
+                if crate::channels::wasm::signature::verify_discord_signature(
                     &pub_key_hex,
                     sig,
                     ts,
                     &body,
                     now_secs,
                 ) {
-                    tracing::warn!(
-                        channel = %channel_name,
-                        "Ed25519 signature verification failed"
-                    );
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "error": "Invalid signature"
-                        })),
-                    );
+                    tracing::debug!(channel = %channel_name, "Ed25519 signature verified");
+                    secret_validated = true;
+                } else {
+                    tracing::warn!(channel = %channel_name, "Ed25519 signature verification failed");
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Invalid signature" })));
                 }
-                tracing::debug!(channel = %channel_name, "Ed25519 signature verified");
             }
             _ => {
-                tracing::warn!(
-                    channel = %channel_name,
-                    "Signature headers missing but key is registered"
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": "Missing signature headers"
-                    })),
-                );
+                // Only fail if secret header wasn't already validated
+                if !secret_validated {
+                    tracing::warn!(channel = %channel_name, "Signature headers missing but key is registered");
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Missing signature headers" })));
+                }
             }
         }
     }
 
-    // HMAC-SHA256 signature verification (Slack-style)
+    // 3. HMAC-SHA256 signature verification (Slack-style)
     if let Some(hmac_secret) = state.router.get_hmac_secret(channel_name).await {
         let timestamp = headers
             .get("x-slack-request-timestamp")
@@ -465,42 +442,31 @@ async fn webhook_handler(
                     .unwrap_or_default()
                     .as_secs() as i64;
 
-                if !crate::channels::wasm::signature::verify_slack_signature(
+                if crate::channels::wasm::signature::verify_slack_signature(
                     &hmac_secret,
                     ts,
                     &body,
                     sig,
                     now_secs,
                 ) {
-                    tracing::warn!(
-                        channel = %channel_name,
-                        "HMAC-SHA256 signature verification failed"
-                    );
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "error": "Invalid Slack signature"
-                        })),
-                    );
+                    tracing::debug!(channel = %channel_name, "HMAC-SHA256 signature verified");
+                    secret_validated = true;
+                } else {
+                    tracing::warn!(channel = %channel_name, "HMAC-SHA256 signature verification failed");
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Invalid Slack signature" })));
                 }
-                tracing::debug!(channel = %channel_name, "HMAC-SHA256 signature verified");
             }
             _ => {
-                tracing::warn!(
-                    channel = %channel_name,
-                    "Slack signature headers missing but secret is registered"
-                );
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": "Missing Slack signature headers"
-                    })),
-                );
+                // Only fail if secret header wasn't already validated
+                if !secret_validated {
+                    tracing::warn!(channel = %channel_name, "Slack signature headers missing but secret is registered");
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Missing Slack signature headers" })));
+                }
             }
         }
     }
 
-    // Convert headers to HashMap
+    // Convert headers to HashMap for the WASM guest
     let headers_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| {
@@ -509,9 +475,6 @@ async fn webhook_handler(
                 .map(|v| (k.as_str().to_string(), v.to_string()))
         })
         .collect();
-
-    // Call the WASM channel
-    let secret_validated = state.router.requires_secret(channel_name).await;
 
     tracing::info!(
         channel = %channel_name,

@@ -66,7 +66,11 @@ impl Router {
         let content = message.content.trim();
 
         if content.starts_with(&self.command_prefix) {
-            Some(self.parse_command(content))
+            let intent = self.parse_command(content);
+            match intent {
+                MessageIntent::Unknown => None,
+                _ => Some(intent),
+            }
         } else {
             None
         }
@@ -116,13 +120,43 @@ impl Router {
                     }
                 }
             }
-            Some(cmd) => MessageIntent::Command {
+            Some("ask") => {
+                let rest = parts[1..].join(" ");
+                // Strip "question: " prefix if present (common in Discord slash commands)
+                let content = if let Some(stripped) = rest.strip_prefix("question: ") {
+                    stripped.to_string()
+                } else {
+                    rest
+                };
+                MessageIntent::Chat { content }
+            }
+            Some(cmd) if is_system_command(cmd) => MessageIntent::Command {
                 command: cmd.to_string(),
                 args: parts[1..].iter().map(|s| s.to_string()).collect(),
             },
-            None => MessageIntent::Unknown,
+            _ => MessageIntent::Unknown,
         }
     }
+}
+
+fn is_system_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "help"
+            | "ping"
+            | "restart"
+            | "version"
+            | "tools"
+            | "debug"
+            | "skills"
+            | "model"
+            | "status"
+            | "list"
+            | "cancel"
+            | "job"
+            | "create"
+            | "jobs"
+    )
 }
 
 impl Default for Router {
@@ -196,5 +230,30 @@ mod tests {
             }
             _ => panic!("Expected ListJobs intent"),
         }
+    }
+
+    #[test]
+    fn test_ask_command_returns_chat_intent() {
+        let router = Router::new();
+
+        let msg = IncomingMessage::new("test", "user", "/ask question: how are you?");
+        let intent = router.route_command(&msg);
+
+        match intent {
+            Some(MessageIntent::Chat { content }) => {
+                assert_eq!(content, "how are you?");
+            }
+            _ => panic!("Expected Chat intent for /ask"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_command_returns_none() {
+        let router = Router::new();
+
+        let msg = IncomingMessage::new("test", "user", "/unknown_foo_bar");
+        let intent = router.route_command(&msg);
+
+        assert!(intent.is_none(), "Unknown command should return None to fallback to chat");
     }
 }

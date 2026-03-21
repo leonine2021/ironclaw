@@ -109,25 +109,26 @@ impl NearAiChatProvider {
                 let pricing = provider.pricing.clone();
 
                 handle.spawn(async move {
-                match fetch_pricing(&client, &base_url, api_key.as_ref(), &session).await {
-                    Ok(map) if !map.is_empty() => {
-                        tracing::debug!("Loaded NEAR AI pricing for {} model(s)", map.len());
-                        match pricing.write() {
-                            Ok(mut guard) => *guard = map,
-                            Err(poisoned) => *poisoned.into_inner() = map,
+                    match fetch_pricing(&client, &base_url, api_key.as_ref(), &session).await {
+                        Ok(map) if !map.is_empty() => {
+                            tracing::debug!("Loaded NEAR AI pricing for {} model(s)", map.len());
+                            match pricing.write() {
+                                Ok(mut guard) => *guard = map,
+                                Err(poisoned) => *poisoned.into_inner() = map,
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::debug!("NEAR AI pricing endpoint returned no pricing data");
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Could not fetch NEAR AI pricing (will use fallback): {}",
+                                e
+                            );
                         }
                     }
-                    Ok(_) => {
-                        tracing::debug!("NEAR AI pricing endpoint returned no pricing data");
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "Could not fetch NEAR AI pricing (will use fallback): {}",
-                            e
-                        );
-                    }
-                }
-            });
+                });
+            }
         }
 
         Ok(provider)
