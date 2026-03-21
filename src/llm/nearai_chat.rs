@@ -42,10 +42,9 @@ pub struct NearAiChatProvider {
     /// Session manager for session token auth (used when no API key is set).
     session: Arc<SessionManager>,
     active_model: std::sync::RwLock<String>,
-    flatten_tool_messages: bool,
-    /// Per-model pricing fetched from the NEAR AI `/v1/model/list` endpoint.
-    /// Maps model ID → (input_cost_per_token, output_cost_per_token).
     pricing: Arc<std::sync::RwLock<HashMap<String, (Decimal, Decimal)>>>,
+    extra_headers: reqwest::header::HeaderMap,
+    flatten_tool_messages: bool,
 }
 
 impl NearAiChatProvider {
@@ -96,18 +95,20 @@ impl NearAiChatProvider {
             active_model,
             flatten_tool_messages,
             pricing,
+            extra_headers: reqwest::header::HeaderMap::new(),
         };
 
         // Fire-and-forget background pricing fetch — don't block startup.
-        // Only spawns when a tokio runtime is active (skipped in sync tests).
+        // Skip for Gemini (doesn't support NEAR pricing endpoint).
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let client = provider.client.clone();
-            let base_url = provider.config.base_url.clone();
-            let api_key = provider.config.api_key.clone();
-            let session = provider.session.clone();
-            let pricing = provider.pricing.clone();
+            if !provider.config.base_url.contains("generativelanguage.googleapis.com") {
+                let client = provider.client.clone();
+                let base_url = provider.config.base_url.clone();
+                let api_key = provider.config.api_key.clone();
+                let session = provider.session.clone();
+                let pricing = provider.pricing.clone();
 
-            handle.spawn(async move {
+                handle.spawn(async move {
                 match fetch_pricing(&client, &base_url, api_key.as_ref(), &session).await {
                     Ok(map) if !map.is_empty() => {
                         tracing::debug!("Loaded NEAR AI pricing for {} model(s)", map.len());
@@ -132,11 +133,18 @@ impl NearAiChatProvider {
         Ok(provider)
     }
 
+    pub fn with_extra_headers(mut self, headers: reqwest::header::HeaderMap) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
     fn api_url(&self, path: &str) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
 
-        if base.ends_with("/v1") {
+        // If the base URL already contains /v1, /v1beta, or /openai,
+        // assume it's a complete OpenAI-compatible base URL.
+        if base.contains("/v1") || base.contains("/openai") {
             format!("{}/{}", base, path)
         } else {
             format!("{}/v1/{}", base, path)
@@ -228,15 +236,16 @@ impl NearAiChatProvider {
             tracing::debug!("NEAR AI Chat request body: {}", json);
         }
 
-        let response = self
+        let response: reqwest::Response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
+            .headers(self.extra_headers.clone())
             .json(body)
             .send()
             .await
-            .map_err(|e| LlmError::RequestFailed {
+            .map_err(|e: reqwest::Error| LlmError::RequestFailed {
                 provider: "nearai_chat".to_string(),
                 reason: e.to_string(),
             })?;
@@ -248,8 +257,8 @@ impl NearAiChatProvider {
         let retry_after_header = response
             .headers()
             .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
+            .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+            .and_then(|v: &str| {
                 // Try delay-seconds first (most common from API providers)
                 if let Ok(secs) = v.trim().parse::<u64>() {
                     return Some(cap_retry_after(std::time::Duration::from_secs(secs)));
@@ -267,7 +276,7 @@ impl NearAiChatProvider {
                 None
             })
             .or(Some(std::time::Duration::from_secs(60)));
-        let response_text = response.text().await.map_err(|e| LlmError::RequestFailed {
+        let response_text = response.text().await.map_err(|e: reqwest::Error| LlmError::RequestFailed {
             provider: "nearai_chat".to_string(),
             reason: format!("Failed to read response body: {}", e),
         })?;
@@ -354,7 +363,7 @@ impl NearAiChatProvider {
             })?;
 
         let status = response.status();
-        let response_text = response.text().await.map_err(|e| LlmError::RequestFailed {
+        let response_text = response.text().await.map_err(|e: reqwest::Error| LlmError::RequestFailed {
             provider: "nearai_chat".to_string(),
             reason: format!("Failed to read response body: {}", e),
         })?;
@@ -586,6 +595,7 @@ impl LlmProvider for NearAiChatProvider {
                     id: tc.id,
                     name: tc.function.name,
                     arguments,
+                    thought_signature: tc.thought_signature,
                 }
             })
             .collect();
@@ -978,6 +988,7 @@ impl From<ChatMessage> for ChatCompletionMessage {
                         name: tc.name,
                         arguments: tc.arguments.to_string(),
                     },
+                    thought_signature: tc.thought_signature,
                 })
                 .collect()
         });
@@ -1054,6 +1065,8 @@ struct ChatCompletionToolCall {
     #[allow(dead_code)]
     call_type: String,
     function: ChatCompletionToolCallFunction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1179,11 +1192,13 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "list_issues".to_string(),
                 arguments: serde_json::json!({"owner": "foo", "repo": "bar"}),
+                thought_signature: None,
             },
             ToolCall {
                 id: "call_2".to_string(),
                 name: "search".to_string(),
                 arguments: serde_json::json!({"query": "test"}),
+                thought_signature: None,
             },
         ];
 
@@ -1216,6 +1231,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "test".to_string(),
             arguments: serde_json::json!({"key": "value"}),
+            thought_signature: None,
         };
         let msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
         let chat_msg: ChatCompletionMessage = msg.into();
@@ -1273,6 +1289,7 @@ mod tests {
                         name: "echo".to_string(),
                         arguments: r#"{"message":"hi"}"#.to_string(),
                     },
+                    thought_signature: None,
                 }]),
             },
             ChatCompletionMessage {
@@ -1327,6 +1344,7 @@ mod tests {
                         name: "search".to_string(),
                         arguments: r#"{"q":"test"}"#.to_string(),
                     },
+                    thought_signature: None,
                 }]),
             },
             ChatCompletionMessage {
@@ -1455,7 +1473,7 @@ mod tests {
             .map(|tc| {
                 let arguments = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
-                ToolCall {
+                ToolCall { thought_signature: None,
                     id: tc.id,
                     name: tc.function.name,
                     arguments,
@@ -1504,7 +1522,7 @@ mod tests {
             .map(|tc| {
                 let arguments = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
-                ToolCall {
+                ToolCall { thought_signature: None,
                     id: tc.id,
                     name: tc.function.name,
                     arguments,
@@ -1740,6 +1758,7 @@ mod tests {
                     name: "echo".to_string(),
                     arguments: "{}".to_string(),
                 },
+                thought_signature: None,
             }]),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -2080,6 +2099,7 @@ mod tests {
                             name: "search".to_string(),
                             arguments: r#"{"q":"a"}"#.to_string(),
                         },
+                        thought_signature: None,
                     },
                     ChatCompletionToolCall {
                         id: "call_2".to_string(),
@@ -2088,6 +2108,7 @@ mod tests {
                             name: "fetch".to_string(),
                             arguments: r#"{"url":"http://x"}"#.to_string(),
                         },
+                        thought_signature: None,
                     },
                 ]),
             },
@@ -2130,6 +2151,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "test".to_string(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             }],
         );
         let chat_msg: ChatCompletionMessage = msg.into();
@@ -2184,6 +2206,7 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: r#"{"city":"London"}"#.to_string(),
             },
+            thought_signature: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         // "type" not "call_type" in serialized form

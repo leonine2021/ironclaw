@@ -26,10 +26,10 @@ use std::collections::HashSet;
 use crate::llm::costs;
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
-    ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
-    ToolDefinition as IronToolDefinition, strip_unsupported_completion_params,
-    strip_unsupported_tool_params,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason,
+    LlmProvider, ToolCall as IronToolCall, ToolCompletionRequest,
+    ToolCompletionResponse, ToolDefinition as IronToolDefinition,
+    strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
@@ -301,20 +301,20 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                                 // Format: data:<mime>;base64,<data>
                                 let (mime, b64) =
                                     rest.split_once(";base64,").unwrap_or(("image/jpeg", rest));
-                                Image {
-                                    data: DocumentSourceKind::base64(b64),
-                                    media_type: ImageMediaType::from_mime_type(mime),
-                                    detail: None,
-                                    additional_params: None,
-                                }
-                            } else {
-                                Image {
-                                    data: DocumentSourceKind::url(&image_url.url),
-                                    media_type: None,
-                                    detail: None,
-                                    additional_params: None,
-                                }
-                            };
+                                        Image {
+                                            data: DocumentSourceKind::base64(b64),
+                                            media_type: ImageMediaType::from_mime_type(mime),
+                                            detail: Some(rig::message::ImageDetail::Auto),
+                                            additional_params: None,
+                                        }
+                                    } else {
+                                        Image {
+                                            data: DocumentSourceKind::url(&image_url.url),
+                                            media_type: None,
+                                            detail: Some(rig::message::ImageDetail::Auto),
+                                            additional_params: None,
+                                        }
+                                    };
                             contents.push(UserContent::Image(image));
                         }
                     }
@@ -442,6 +442,7 @@ fn extract_response(
                     id: tc.id.clone(),
                     name: tc.function.name.clone(),
                     arguments: tc.function.arguments.clone(),
+                    thought_signature: None,
                 });
             }
             // Reasoning and Image variants are not mapped to IronClaw types
@@ -766,6 +767,7 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::provider::{ContentPart, ImageUrl as IronImageUrl};
 
     #[test]
     fn test_convert_messages_system_to_preamble() {
@@ -819,6 +821,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "test"}),
+            thought_signature: None,
         };
         let msg = ChatMessage::assistant_with_tool_calls(Some("thinking".to_string()), vec![tc]);
         let messages = vec![msg];
@@ -929,6 +932,7 @@ mod tests {
             id: "".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "test"}),
+            thought_signature: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
         let (_preamble, history) = convert_messages(&messages);
@@ -958,6 +962,7 @@ mod tests {
             id: "   ".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "test"}),
+            thought_signature: None,
         };
         let messages = vec![ChatMessage::assistant_with_tool_calls(None, vec![tc])];
         let (_preamble, history) = convert_messages(&messages);
@@ -988,6 +993,7 @@ mod tests {
             id: "".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "test"}),
+            thought_signature: None,
         };
         let assistant_msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
         let tool_result_msg = ChatMessage {
@@ -1307,11 +1313,13 @@ mod tests {
             id: "call_a".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"q": "rust"}),
+            thought_signature: None,
         };
         let tc2 = IronToolCall {
             id: "call_b".to_string(),
             name: "fetch".to_string(),
             arguments: serde_json::json!({"url": "https://example.com"}),
+            thought_signature: None,
         };
         let assistant = ChatMessage::assistant_with_tool_calls(None, vec![tc1, tc2]);
         let result_a = ChatMessage::tool_result("call_a", "search", "search results");
@@ -1359,5 +1367,40 @@ mod tests {
 
         // Should be 2 separate User messages (text user + tool result user)
         assert_eq!(history.len(), 2);
+    }
+    /// Verify that multimodal user messages (text + image) are converted
+    /// correctly and include the required `detail` field for images.
+    #[test]
+    fn test_convert_messages_multimodal() {
+        let msg = ChatMessage::user_with_parts(
+            "what is in this image?",
+            vec![ContentPart::ImageUrl {
+                image_url: IronImageUrl {
+                    url: "https://example.com/image.png".to_string(),
+                    detail: None,
+                },
+            }],
+        );
+        let messages = vec![msg];
+        let (_preamble, history) = convert_messages(&messages);
+
+        assert_eq!(history.len(), 1);
+        match &history[0] {
+            RigMessage::User { content } => {
+                // Should have 1 text part + 1 image part
+                assert_eq!(content.len(), 2);
+                let image_part = content.iter().find_map(|c| match c {
+                    UserContent::Image(img) => Some(img),
+                    _ => None,
+                });
+                let img = image_part.expect("should have an image part");
+                assert_eq!(img.detail, Some(rig::message::ImageDetail::Auto));
+                match &img.data {
+                    DocumentSourceKind::Url(url) => assert_eq!(url, "https://example.com/image.png"),
+                    other => panic!("Expected URL image data, got: {:?}", other),
+                }
+            }
+            other => panic!("Expected User message, got: {:?}", other),
+        }
     }
 }

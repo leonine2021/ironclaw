@@ -150,7 +150,9 @@ fn create_registry_provider(
     }
 
     match config.protocol {
-        ProviderProtocol::OpenAiCompletions => create_openai_compat_from_registry(config),
+        ProviderProtocol::OpenAiCompletions => {
+            create_openai_compat_from_registry(config, request_timeout_secs)
+        }
         ProviderProtocol::Anthropic => create_anthropic_from_registry(config),
         ProviderProtocol::Ollama => create_ollama_from_registry(config),
     }
@@ -207,8 +209,64 @@ async fn create_bedrock_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvid
 
 fn create_openai_compat_from_registry(
     config: &RegistryProviderConfig,
+    request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     use rig::providers::openai;
+
+    // Check if we should use NearAiChatProvider (for better flexibility / thought_signature).
+    // Gemini's OpenAI-compatible endpoint requires thought_signature support, which
+    // rig-core's default OpenAI implementation doesn't provide.
+    let is_gemini = config.provider_id == "gemini"
+        || config.base_url.contains("generativelanguage.googleapis.com");
+
+    if is_gemini {
+        tracing::debug!(
+            provider = %config.provider_id,
+            model = %config.model,
+            "Using NearAiChatProvider for Gemini (thought_signature support)"
+        );
+
+        let nearai_config = NearAiConfig {
+            model: config.model.clone(),
+            cheap_model: None,
+            base_url: config.base_url.clone(),
+            api_key: config.api_key.clone(),
+            fallback_model: None,
+            max_retries: 3,
+            circuit_breaker_threshold: None,
+            circuit_breaker_recovery_secs: 30,
+            response_cache_enabled: false,
+            response_cache_ttl_secs: 3600,
+            response_cache_max_entries: 1000,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
+            smart_routing_cascade: true,
+        };
+
+        // Use a dummy session manager (no OAuth for generic OpenAI-compatible)
+        let session = Arc::new(session::SessionManager::new(session::SessionConfig::default()));
+        let provider = NearAiChatProvider::new_with_timeout(
+            nearai_config,
+            session,
+            request_timeout_secs,
+        )?;
+
+        // Convert and inject extra headers
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (key, value) in &config.extra_headers {
+            let name = match reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let val = match reqwest::header::HeaderValue::from_str(value) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            headers.insert(name, val);
+        }
+
+        return Ok(Arc::new(provider.with_extra_headers(headers)));
+    }
 
     let mut extra_headers = reqwest::header::HeaderMap::new();
     for (key, value) in &config.extra_headers {

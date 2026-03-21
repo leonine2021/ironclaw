@@ -231,6 +231,10 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Optional Gemini-specific thought signature for tool calls.
+    /// Required for subsequent turns in a conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Result of a tool execution to send back to the LLM.
@@ -540,6 +544,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
         let mut messages = vec![
             ChatMessage::user("hello"),
@@ -583,6 +588,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
         let mut messages = vec![
             ChatMessage::user("test"),
@@ -608,11 +614,13 @@ mod tests {
             id: "call_sel_1".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"q": "test"}),
+            thought_signature: None,
         };
         let tc2 = ToolCall {
             id: "call_sel_2".to_string(),
             name: "http".to_string(),
             arguments: serde_json::json!({"url": "https://example.com"}),
+            thought_signature: None,
         };
         let mut messages = vec![
             ChatMessage::system("You are a helpful assistant."),
