@@ -874,6 +874,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reasoning: action.reasoning.clone(),
                 alternatives: vec![],
                 tool_call_id: format!("plan_{}_{}", self.job_id, i),
+                thought_signature: None,
             };
 
             reason_ctx
@@ -1357,6 +1358,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                 reasoning: String::new(),
                 alternatives: vec![],
                 tool_call_id: tc.id.clone(),
+                thought_signature: tc.thought_signature.clone(),
             })
             .collect();
 
@@ -1407,7 +1409,7 @@ fn selections_to_tool_calls(selections: &[ToolSelection]) -> Vec<ToolCall> {
             id: s.tool_call_id.clone(),
             name: s.tool_name.clone(),
             arguments: s.parameters.clone(),
-            thought_signature: None,
+            thought_signature: s.thought_signature.clone(),
         })
         .collect()
 }

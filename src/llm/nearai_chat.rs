@@ -229,7 +229,10 @@ impl NearAiChatProvider {
         let url = self.api_url("chat/completions");
         let token = self.resolve_bearer_token().await?;
 
-        tracing::debug!("Sending request to NEAR AI Chat: {}", url);
+        tracing::debug!(
+            url = %self.config.base_url,
+            "Sending request to NEAR AI Chat"
+        );
 
         if tracing::enabled!(tracing::Level::DEBUG)
             && let Ok(json) = serde_json::to_string(body)
@@ -574,6 +577,12 @@ impl LlmProvider for NearAiChatProvider {
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Ok(json) = serde_json::to_string(&response) {
+                tracing::debug!("Gemini raw response JSON: {}", json);
+            }
+        }
+
         let choice =
             response
                 .choices
@@ -592,11 +601,26 @@ impl LlmProvider for NearAiChatProvider {
             .map(|tc| {
                 let arguments = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
+                let mut signature = tc.thought_signature.or(tc.function.thought_signature);
+                
+                // Extract from extra_content.google.thought_signature if present
+                if signature.is_none() {
+                    if let Some(extra) = tc.extra_fields.get("extra_content") {
+                        if let Some(google) = extra.get("google") {
+                            if let Some(sig) = google.get("thought_signature") {
+                                if let Some(sig_str) = sig.as_str() {
+                                    signature = Some(sig_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
                 ToolCall {
                     id: tc.id,
                     name: tc.function.name,
                     arguments,
-                    thought_signature: tc.thought_signature,
+                    thought_signature: signature,
                 }
             })
             .collect();
@@ -982,14 +1006,28 @@ impl From<ChatMessage> for ChatCompletionMessage {
         let tool_calls = msg.tool_calls.map(|calls| {
             calls
                 .into_iter()
-                .map(|tc| ChatCompletionToolCall {
-                    id: tc.id,
-                    call_type: "function".to_string(),
-                    function: ChatCompletionToolCallFunction {
-                        name: tc.name,
-                        arguments: tc.arguments.to_string(),
-                    },
-                    thought_signature: tc.thought_signature,
+                .map(|tc| {
+                    let mut extra_fields = serde_json::Map::new();
+                    
+                    // If we have a signature, ensure it's in extra_content for Gemini
+                    if let Some(sig) = &tc.thought_signature {
+                        let google = serde_json::json!({ "thought_signature": sig });
+                        let extra_content = serde_json::json!({ "google": google });
+                        extra_fields.insert("extra_content".to_string(), extra_content);
+                    }
+
+                    ChatCompletionToolCall {
+                        id: tc.id.clone(),
+                        call_type: "function".to_string(),
+                        function: ChatCompletionToolCallFunction {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.to_string(),
+                            thought_signature: tc.thought_signature.clone(),
+                            extra_fields: Default::default(),
+                        },
+                        thought_signature: tc.thought_signature.clone(),
+                        extra_fields,
+                    }
                 })
                 .collect()
         });
@@ -1031,23 +1069,24 @@ struct ChatCompletionFunction {
     parameters: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionResponse {
-    #[allow(dead_code)]
-    #[serde(default)]
-    id: Option<String>,
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
     choices: Vec<ChatCompletionChoice>,
     #[serde(default)]
     usage: Option<ChatCompletionUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionChoice {
     message: ChatCompletionResponseMessage,
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionResponseMessage {
     #[allow(dead_code)]
     role: String,
@@ -1066,17 +1105,23 @@ struct ChatCompletionToolCall {
     #[allow(dead_code)]
     call_type: String,
     function: ChatCompletionToolCallFunction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "thoughtSignature")]
     thought_signature: Option<String>,
+    #[serde(flatten)]
+    extra_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ChatCompletionToolCallFunction {
     name: String,
     arguments: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "thoughtSignature")]
+    thought_signature: Option<String>,
+    #[serde(flatten)]
+    extra_fields: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct ChatCompletionUsage {
     #[serde(default)]
     prompt_tokens: Option<u64>,
@@ -1289,8 +1334,11 @@ mod tests {
                     function: ChatCompletionToolCallFunction {
                         name: "echo".to_string(),
                         arguments: r#"{"message":"hi"}"#.to_string(),
+                        thought_signature: None,
+                        extra_fields: Default::default(),
                     },
                     thought_signature: None,
+                    extra_fields: Default::default(),
                 }]),
             },
             ChatCompletionMessage {
@@ -1344,8 +1392,11 @@ mod tests {
                     function: ChatCompletionToolCallFunction {
                         name: "search".to_string(),
                         arguments: r#"{"q":"test"}"#.to_string(),
+                        thought_signature: None,
+                        extra_fields: Default::default(),
                     },
                     thought_signature: None,
+                    extra_fields: Default::default(),
                 }]),
             },
             ChatCompletionMessage {
@@ -1758,8 +1809,11 @@ mod tests {
                 function: ChatCompletionToolCallFunction {
                     name: "echo".to_string(),
                     arguments: "{}".to_string(),
+                    thought_signature: None,
+                    extra_fields: Default::default(),
                 },
                 thought_signature: None,
+                extra_fields: Default::default(),
             }]),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -2099,8 +2153,8 @@ mod tests {
                         function: ChatCompletionToolCallFunction {
                             name: "search".to_string(),
                             arguments: r#"{"q":"a"}"#.to_string(),
+                            thought_signature: None,
                         },
-                        thought_signature: None,
                     },
                     ChatCompletionToolCall {
                         id: "call_2".to_string(),

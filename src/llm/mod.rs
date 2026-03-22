@@ -245,9 +245,10 @@ fn create_openai_compat_from_registry(
 
         // Use a dummy session manager (no OAuth for generic OpenAI-compatible)
         let session = Arc::new(session::SessionManager::new(session::SessionConfig::default()));
-        let provider = NearAiChatProvider::new_with_timeout(
+        let provider = NearAiChatProvider::new_with_options(
             nearai_config,
             session,
+            false, // Gemini requires structured tool calls to preserve thought_signature
             request_timeout_secs,
         )?;
 

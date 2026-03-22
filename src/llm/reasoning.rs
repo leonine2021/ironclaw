@@ -298,6 +298,8 @@ pub struct ToolSelection {
     /// be echoed back in the corresponding tool result message. Without this,
     /// the provider cannot match results to their originating calls.
     pub tool_call_id: String,
+    /// Optional Gemini-specific thought signature.
+    pub thought_signature: Option<String>,
 }
 
 /// Token usage from a single LLM call.
@@ -530,6 +532,7 @@ impl Reasoning {
                 reasoning: reasoning.clone(),
                 alternatives: vec![],
                 tool_call_id: tool_call.id,
+                thought_signature: tool_call.thought_signature,
             })
             .collect();
 
@@ -1360,7 +1363,6 @@ fn recover_tool_calls_from_content(
     }
 
     // Bracket format from flatten_tool_messages:
-    // [Called tool `name` with arguments: {...}]
     {
         let mut remaining = content;
         while let Some(start) = remaining.find("[Called tool `") {

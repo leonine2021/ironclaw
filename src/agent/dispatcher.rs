@@ -1625,13 +1625,13 @@ mod tests {
             ChatMessage::assistant_with_tool_calls(
                 None,
                 vec![ToolCall {
-                    id: "call_1".to_string(),
+                    id: "call_123".to_string(),
                     name: "echo".to_string(),
                     arguments: serde_json::json!({"message": "hi"}),
                     thought_signature: None,
                 }],
             ),
-            ChatMessage::tool_result("call_1", "echo", "hi"),
+            ChatMessage::tool_result("call_123", "echo", "hi"),
         ];
 
         let compacted = compact_messages_for_retry(&messages);
