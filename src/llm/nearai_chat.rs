@@ -577,11 +577,6 @@ impl LlmProvider for NearAiChatProvider {
 
         let response: ChatCompletionResponse = self.send_request(&request).await?;
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            if let Ok(json) = serde_json::to_string(&response) {
-                tracing::debug!("Gemini raw response JSON: {}", json);
-            }
-        }
 
         let choice =
             response
