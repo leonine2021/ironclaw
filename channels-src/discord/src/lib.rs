@@ -405,69 +405,75 @@ impl Guest for DiscordChannel {
         let metadata: DiscordMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        // Truncate content to 2000 characters to comply with Discord limits
-        let content = truncate_message(&response.content);
+        // Split content to 2000 characters to comply with Discord limits
+        let chunks = split_message(&response.content, 2000);
 
-        let mut payload = serde_json::json!({ "content": content });
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut payload = serde_json::json!({ "content": chunk });
 
-        // Check for embeds in metadata
-        if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&response.metadata_json) {
-            if let Some(embeds) = meta_json.get("embeds") {
-                payload["embeds"] = embeds.clone();
+            // On the first chunk, include embeds and handle interaction response
+            if i == 0 {
+                // Check for embeds in metadata
+                if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&response.metadata_json) {
+                    if let Some(embeds) = meta_json.get("embeds") {
+                        payload["embeds"] = embeds.clone();
+                    }
+                }
+            }
+
+            let (method, url) = if i == 0 && metadata.token.is_some() && metadata.application_id.is_some() {
+                // First chunk of an interaction response
+                (
+                    "PATCH",
+                    format!(
+                        "https://discord.com/api/v10/webhooks/{}/{}/messages/@original",
+                        metadata.application_id.as_ref().unwrap(),
+                        metadata.token.as_ref().unwrap()
+                    ),
+                )
+            } else {
+                // Subsequent chunks or non-interaction responses
+                if i == 0 && metadata.source_message_id.is_some() {
+                    payload["message_reference"] = serde_json::json!({
+                        "message_id": metadata.source_message_id.as_ref().unwrap()
+                    });
+                    payload["allowed_mentions"] = serde_json::json!({
+                        "replied_user": true
+                    });
+                }
+                (
+                    "POST",
+                    format!(
+                        "https://discord.com/api/v10/channels/{}/messages",
+                        metadata.channel_id
+                    ),
+                )
+            };
+
+            let payload_bytes =
+                serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
+
+            let headers = serde_json::json!({
+                "Content-Type": "application/json"
+            });
+
+            let result = channel_host::http_request(
+                method,
+                &url,
+                &headers.to_string(),
+                Some(&payload_bytes),
+                None,
+            );
+
+            if let Err(e) = result {
+                channel_host::log(channel_host::LogLevel::Error, &format!("Failed to send chunk {}: {}", i, e));
+                if i == 0 {
+                    return Err(e);
+                }
             }
         }
 
-        let payload_bytes =
-            serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
-
-        let headers = serde_json::json!({
-            "Content-Type": "application/json"
-        });
-
-        let (method, url) = if let (Some(application_id), Some(token)) =
-            (metadata.application_id.as_ref(), metadata.token.as_ref())
-        {
-            (
-                "PATCH",
-                format!(
-                    "https://discord.com/api/v10/webhooks/{}/{}/messages/@original",
-                    application_id, token
-                ),
-            )
-        } else if let Some(source_message_id) = metadata.source_message_id.as_ref() {
-            payload["message_reference"] = serde_json::json!({
-                "message_id": source_message_id
-            });
-            payload["allowed_mentions"] = serde_json::json!({
-                "replied_user": true
-            });
-            let mention_payload = serde_json::to_vec(&payload)
-                .map_err(|e| format!("Failed to serialize mention payload: {}", e))?;
-            let mention_url = format!(
-                "https://discord.com/api/v10/channels/{}/messages",
-                metadata.channel_id
-            );
-            let result = channel_host::http_request(
-                "POST",
-                &mention_url,
-                &discord_auth_headers_json(true),
-                Some(&mention_payload),
-                None,
-            );
-            return map_discord_response(result);
-        } else {
-            return Err("Unsupported Discord response metadata".to_string());
-        };
-
-        let result = channel_host::http_request(
-            method,
-            &url,
-            &headers.to_string(),
-            Some(&payload_bytes),
-            None,
-        );
-
-        map_discord_response(result)
+        Ok(())
     }
 
     fn on_status(_update: StatusUpdate) {}
@@ -1210,21 +1216,39 @@ fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse 
 
 export!(DiscordChannel);
 
-fn truncate_message(content: &str) -> String {
-    if content.len() <= 2000 {
-        content.to_string()
-    } else {
-        let max_bytes = 1990;
-        let cutoff = content
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|&end| end <= max_bytes)
-            .last()
-            .unwrap_or(0);
-        let mut truncated = content[..cutoff].to_string();
-        truncated.push_str("\n... (truncated)");
-        truncated
+fn split_message(content: &str, max_chars: usize) -> Vec<String> {
+    if content.chars().count() <= max_chars {
+        return vec![content.to_string()];
     }
+
+    let mut chunks = Vec::new();
+    let mut current = content;
+
+    while !current.is_empty() {
+        let char_count = current.chars().count();
+        if char_count <= max_chars {
+            chunks.push(current.to_string());
+            break;
+        }
+
+        // Find the byte index at max_chars
+        let mut split_at = current.char_indices()
+            .map(|(i, _)| i)
+            .nth(max_chars)
+            .unwrap_or(current.len());
+
+        // Try to find a newline before the limit to avoid mid-sentence splits
+        if let Some(nl_pos) = current[..split_at].rfind('\n') {
+            if nl_pos > max_chars / 2 {
+                split_at = nl_pos;
+            }
+        }
+
+        chunks.push(current[..split_at].to_string());
+        current = &current[split_at..].trim_start();
+    }
+
+    chunks
 }
 
 #[cfg(test)]
@@ -1233,29 +1257,34 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
-    fn test_truncate_message() {
+    fn test_split_message() {
         let short = "Hello world";
-        assert_eq!(truncate_message(short), short);
+        assert_eq!(split_message(short, 2000), vec![short.to_string()]);
 
         let long = "a".repeat(2005);
-        let truncated = truncate_message(&long);
-        assert_eq!(truncated.len(), 2006); // 1990 + 16 chars suffix
-        assert!(truncated.ends_with("\n... (truncated)"));
+        let chunks = split_message(&long, 2000);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2000);
+        assert_eq!(chunks[1].len(), 5);
 
-        // Test with multibyte characters (Euro sign is 3 bytes)
-        // 1000 chars * 3 bytes = 3000 bytes
-        let multi = "€".repeat(1000);
-        let truncated_multi = truncate_message(&multi);
+        // Test newline splitting
+        let nl_content = format!("{}\n{}", "a".repeat(1500), "b".repeat(1000));
+        let nl_chunks = split_message(&nl_content, 2000);
+        assert_eq!(nl_chunks.len(), 2);
+        assert_eq!(nl_chunks[0], "a".repeat(1500));
+        assert_eq!(nl_chunks[1], "b".repeat(1000));
 
-        // 1990 bytes limit. 1990 / 3 = 663 with remainder 1.
-        // Should truncate at 663 chars (1989 bytes).
-        // Suffix is 16 bytes. Total: 1989 + 16 = 2005 bytes.
-        assert!(truncated_multi.len() <= 2006);
-        assert!(truncated_multi.len() >= 2006 - 4); // Allow for max utf8 char width variance
-        assert!(truncated_multi.ends_with("\n... (truncated)"));
+        // Test multibyte characters
+        let multi = "€".repeat(1000); // 1000 chars, 3000 bytes
+        let multi_chunks = split_message(&multi, 2000);
+        assert_eq!(multi_chunks.len(), 1);
+        assert_eq!(multi_chunks[0], multi);
 
-        let content_part = &truncated_multi[..truncated_multi.len() - 16];
-        assert!(content_part.chars().all(|c| c == '€'));
+        let very_multi = "€".repeat(2500);
+        let very_multi_chunks = split_message(&very_multi, 2000);
+        assert_eq!(very_multi_chunks.len(), 2);
+        assert_eq!(very_multi_chunks[0].chars().count(), 2000);
+        assert_eq!(very_multi_chunks[1].chars().count(), 500);
     }
 
     #[test]

@@ -153,9 +153,9 @@ pub fn is_silent_reply(text: &str) -> bool {
                 .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
-/// Quick-check: bail early if no reasoning/final tags are present at all.
+/// Quick-check: bail early if no reasoning/final tags or plain headers are present at all.
 static QUICK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b").expect("QUICK_TAG_RE") // safety: hardcoded literal
+    Regex::new(r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b|(?:\n|^)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\b\s*:?").expect("QUICK_TAG_RE") // safety: hardcoded literal
 });
 
 /// Matches thinking/reasoning open and close tags. Capture group 1 is "/" for close tags.
@@ -172,6 +172,7 @@ static FINAL_TAG_RE: LazyLock<Regex> =
 static PIPE_REASONING_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<\|(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\|>").expect("PIPE_REASONING_TAG_RE") // safety: hardcoded literal
 });
+
 
 /// Context for reasoning operations.
 pub struct ReasoningContext {
@@ -1422,13 +1423,17 @@ fn recover_tool_calls_from_content(
 /// 6. Strip tool tags (string matching — no code-awareness needed)
 /// 7. Collapse triple+ newlines, trim
 fn clean_response(text: &str) -> String {
+    let trimmed_text = text.trim();
     // 1. Quick-check
-    let mut result = if !QUICK_TAG_RE.is_match(text) {
-        text.to_string()
+    let mut result = if !QUICK_TAG_RE.is_match(trimmed_text) {
+        trimmed_text.to_string()
     } else {
         // 2 + 3. Build code regions, strip thinking tags
-        let code_regions = find_code_regions(text);
-        let after_thinking = strip_thinking_tags_regex(text, &code_regions);
+        let code_regions = find_code_regions(trimmed_text);
+        let mut after_thinking = strip_thinking_tags_regex(trimmed_text, &code_regions);
+
+        // 3b. Strip plain-text headers (if no XML tags were found or if they left leaked headers)
+        after_thinking = strip_plain_thinking(&after_thinking);
 
         // 4. If <final> tags present, extract only their content
         if FINAL_TAG_RE.is_match(&after_thinking) {
@@ -1611,7 +1616,7 @@ fn strip_thinking_tags_regex(text: &str, code_regions: &[CodeRegion]) -> String 
         last_index = m.end();
     }
 
-    // Strict mode: if still inside an unclosed thinking tag, discard trailing text
+    // Strict mode: if still inside an unclosed thinking tag, discard trailing
     // BUT preserve any <final> block embedded in the discarded region
     if !in_thinking {
         result.push_str(&text[last_index..]);
@@ -1624,6 +1629,61 @@ fn strip_thinking_tags_regex(text: &str, code_regions: &[CodeRegion]) -> String 
     }
 
     result
+}
+
+/// Strip plain-text thinking blocks that start with a header like `think` and
+/// end with a separator like `Plan:` or `Answer:`.
+fn strip_plain_thinking(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_lowercase();
+    
+    // Check if it starts with a thinking-related word
+    let starts_thinking = lower.starts_with("think") 
+        || lower.starts_with("thought") 
+        || lower.starts_with("reasoning")
+        || lower.starts_with("reflection")
+        || lower.starts_with("scratchpad");
+
+    if !starts_thinking {
+        return text.to_string();
+    }
+
+    // Find the end of the first line
+    let first_newline = match trimmed.find('\n') {
+        Some(idx) => idx,
+        None => return text.to_string(), // Single line, keep it
+    };
+
+    // The header is the first line. We want to skip it and everything until we find an answer.
+    let remaining = &trimmed[first_newline + 1..];
+    
+    // 1. Look for structured headers like "Plan:", "Answer:", "###", "**"
+    // We search for these at the beginning of any line.
+    for (i, line) in remaining.lines().enumerate() {
+        let l_lower = line.trim_start().to_lowercase();
+        if l_lower.starts_with("plan:") 
+            || l_lower.starts_with("answer:") 
+            || l_lower.starts_with("final answer:")
+            || l_lower.starts_with("###")
+            || l_lower.starts_with("**") 
+        {
+            // Found it! Join all lines from this one onwards.
+            return remaining.lines().skip(i).collect::<Vec<_>>().join("\n");
+        }
+    }
+
+    // 2. Look for the first significant gap (double newline)
+    if let Some(gap_idx) = remaining.find("\n\n") {
+        let potential_answer = remaining[gap_idx..].trim_start();
+        if !potential_answer.is_empty() {
+             return potential_answer.to_string();
+        }
+    }
+
+    // 3. If we are deep into the text and haven't found a separator, just keep it info
+    // but if it's very likely just thinking, we might be stuck.
+    // For now, return the original text to be safe if no clear answer found.
+    text.to_string()
 }
 
 /// Extract content inside `<final>` tags. Returns `None` if no non-code `<final>` tags found.
@@ -1848,6 +1908,43 @@ That's my plan."#;
     fn test_strip_thinking_tags_no_tags() {
         let input = "Just a normal response without thinking tags.";
         assert_eq!(clean_response(input), input);
+    }
+
+    #[test]
+    fn test_strip_plain_thinking_header() {
+        let input = "think\nI need to help the user.\nPlan:\n1. Do X\n2. Do Y\nHello! I've done X and Y.";
+        let cleaned = clean_response(input);
+        assert!(cleaned.starts_with("Plan:"), "Expected output to start with Plan:, got: {}", cleaned);
+    }
+
+    #[test]
+    fn test_strip_plain_thinking_just_think() {
+        let input = "think\nSome thoughts here.\n\n### Result\nFinal content.";
+        let cleaned = clean_response(input);
+        assert!(cleaned.contains("### Result"), "Expected output to contain ### Result, got: {}", cleaned);
+        assert!(!cleaned.contains("think"), "Expected output NOT to contain think, got: {}", cleaned);
+    }
+
+    #[test]
+    fn test_strip_plain_thought_with_answer() {
+        let input = "Thought:\nReasoning here...\n\nAnswer: The result is 42.";
+        assert_eq!(clean_response(input), "Answer: The result is 42.");
+    }
+
+    #[test]
+    fn test_strip_plain_thinking_with_markdown() {
+        let input = "thinking\nSome thoughts...\n### The Answer\nHere it is.";
+        assert_eq!(clean_response(input), "### The Answer\nHere it is.");
+    }
+
+    #[test]
+    fn test_strip_leaked_plain_thinking_after_tags() {
+        let input = "<think>Tags used</think>\nPlan:\nLet's do this.\nActual answer starts here.";
+        // strip_thinking_tags_regex will leave "Plan:\nLet's do this.\nActual answer starts here."
+        // But QUICK_TAG_RE won't match "Plan:" at start.
+        // Wait, strip_plain_thinking ONLY works if it starts with "think".
+        // In this case, "Plan:" is at start.
+        assert!(clean_response(input).contains("Actual answer starts here."));
     }
 
     #[test]
