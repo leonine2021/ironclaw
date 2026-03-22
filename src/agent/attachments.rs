@@ -36,16 +36,25 @@ pub fn augment_with_attachments(
         text.push('\n');
         text.push_str(&format_attachment(i + 1, att));
 
-        // Build multimodal image part when image data is available
-        if att.kind == AttachmentKind::Image && !att.data.is_empty() {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
-            let data_url = format!("data:{};base64,{}", att.mime_type, b64);
-            image_parts.push(ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: data_url,
-                    detail: None,
-                },
-            });
+        // Build multimodal image part when image data is available or source_url is available
+        if att.kind == AttachmentKind::Image {
+            if !att.data.is_empty() {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
+                let data_url = format!("data:{};base64,{}", att.mime_type, b64);
+                image_parts.push(ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: data_url,
+                        detail: None,
+                    },
+                });
+            } else if let Some(url) = &att.source_url {
+                image_parts.push(ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: url.clone(),
+                        detail: None,
+                    },
+                });
+            }
         }
     }
 
@@ -96,10 +105,12 @@ fn format_attachment(index: usize, att: &IncomingAttachment) -> String {
                 .map(|s| format!(" size=\"{}\"", format_size(s)))
                 .unwrap_or_default();
 
-            let body = if att.data.is_empty() {
-                "[Image attached — visual content not available in this conversation]"
-            } else {
+            let body = if !att.data.is_empty() {
                 "[Image attached — sent as visual content]"
+            } else if att.source_url.is_some() {
+                "[Image attached — sent as visual content via URL]"
+            } else {
+                "[Image attached — visual content not available in this conversation]"
             };
 
             format!(

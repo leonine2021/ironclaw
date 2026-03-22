@@ -250,6 +250,11 @@ impl Agent {
                             .process_approval(message, session, thread_id, None, true, false)
                             .await;
                     }
+                    "always" | "a" | "forever" | "all" => {
+                        return self
+                            .process_approval(message, session, thread_id, None, true, true)
+                            .await;
+                    }
                     "no" | "n" | "deny" | "reject" | "stop" | "cancel" | "nope" => {
                         return self
                             .process_approval(message, session, thread_id, None, false, false)

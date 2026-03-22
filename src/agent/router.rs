@@ -123,11 +123,19 @@ impl Router {
             Some("ask") => {
                 let rest = parts[1..].join(" ");
                 // Strip "question: " prefix if present (common in Discord slash commands)
-                let content = if let Some(stripped) = rest.strip_prefix("question: ") {
+                let mut content = if let Some(stripped) = rest.strip_prefix("question: ") {
                     stripped.to_string()
                 } else {
                     rest
                 };
+
+                // If comma-separated (multiple options), take the first one (the question)
+                if let Some(first_comma) = content.find(',') {
+                    content = content[..first_comma].to_string();
+                }
+
+                // Strip literal quotes if present (some JSON serialization in WASM includes them)
+                let content = content.trim().trim_matches('"').to_string();
                 MessageIntent::Chat { content }
             }
             Some(cmd) if is_system_command(cmd) => MessageIntent::Command {

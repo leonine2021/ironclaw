@@ -2216,24 +2216,68 @@ impl WasmChannel {
 
             // Convert attachments
             if !emitted.attachments.is_empty() {
-                let incoming_attachments = emitted
-                    .attachments
-                    .iter()
-                    .map(|a| crate::channels::IncomingAttachment {
+                let mut incoming_attachments = Vec::with_capacity(emitted.attachments.len());
+                for a in &emitted.attachments {
+                    let kind = crate::channels::AttachmentKind::from_mime_type(&a.mime_type);
+                    let mut data = a.data.clone();
+
+                    // If it's an image and has a source_url but no data, attempt to download it
+                    // so it can be sent as base64 to vision models that don't support remote URLs.
+                    if kind == crate::channels::AttachmentKind::Image && data.is_empty() && a.source_url.is_some() {
+                        if let Some(url) = &a.source_url {
+                            tracing::info!(
+                                channel = %self.name,
+                                url = %url,
+                                "Downloading image attachment for host-side base64 conversion"
+                            );
+                            
+                            let client = reqwest::Client::builder()
+                                .timeout(Duration::from_secs(30))
+                                .build()
+                                .unwrap_or_default();
+                            
+                            match client.get(url).send().await {
+                                Ok(resp) if resp.status().is_success() => {
+                                    match resp.bytes().await {
+                                        Ok(bytes) => {
+                                            tracing::debug!(
+                                                channel = %self.name,
+                                                bytes = bytes.len(),
+                                                "Successfully downloaded image attachment"
+                                            );
+                                            data = bytes.to_vec();
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(channel = %self.name, error = %e, "Failed to read image attachment bytes");
+                                        }
+                                    }
+                                }
+                                Ok(resp) => {
+                                    tracing::warn!(channel = %self.name, status = %resp.status(), "Failed to download image attachment: HTTP error");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(channel = %self.name, error = %e, "Failed to download image attachment: request failed");
+                                }
+                            }
+                        }
+                    }
+
+                    incoming_attachments.push(crate::channels::IncomingAttachment {
                         id: a.id.clone(),
-                        kind: crate::channels::AttachmentKind::from_mime_type(&a.mime_type),
+                        kind,
                         mime_type: a.mime_type.clone(),
                         filename: a.filename.clone(),
                         size_bytes: a.size_bytes,
                         source_url: a.source_url.clone(),
                         storage_key: a.storage_key.clone(),
                         extracted_text: a.extracted_text.clone(),
-                        data: a.data.clone(),
+                        data,
                         duration_secs: a.duration_secs,
-                    })
-                    .collect();
+                    });
+                }
                 msg = msg.with_attachments(incoming_attachments);
             }
+
 
             // Parse metadata JSON
             msg = apply_emitted_metadata(msg, &emitted.metadata_json);

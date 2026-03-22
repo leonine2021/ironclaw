@@ -90,6 +90,27 @@ struct DiscordCommandData {
     id: String,
     name: String,
     options: Option<Vec<DiscordCommandOption>>,
+    #[serde(default)]
+    resolved: Option<DiscordResolvedData>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DiscordResolvedData {
+    #[serde(default)]
+    attachments: HashMap<String, DiscordAttachment>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DiscordAttachment {
+    id: String,
+    filename: String,
+    #[serde(rename = "content_type")]
+    mime_type: Option<String>,
+    size: u64,
+    url: String,
+    proxy_url: String,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -966,10 +987,17 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
         .unwrap_or_default();
     let options = interaction.data.as_ref().and_then(|d| d.options.clone());
 
-    let content = if let Some(opts) = options {
+    let content = if let Some(ref opts) = options {
         let opt_str = opts
             .iter()
-            .map(|o| format!("{}: {}", o.name, o.value))
+            .map(|o| {
+                let val_str = if let Some(s) = o.value.as_str() {
+                    s.to_string()
+                } else {
+                    o.value.to_string()
+                };
+                format!("{}: {}", o.name, val_str)
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("/{} {}", command_name, opt_str)
@@ -1013,13 +1041,62 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
         }
     };
 
+    let mut attachments = Vec::new();
+    if let Some(ref data) = interaction.data {
+        let options_len = data.options.as_ref().map(|o| o.len()).unwrap_or(0);
+        let has_resolved = data.resolved.is_some();
+        let attachments_len = data.resolved.as_ref().map(|r| r.attachments.len()).unwrap_or(0);
+        
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!("Processing slash command: {}, options_count: {}, has_resolved: {}, resolved_attachments: {}", 
+                data.name, options_len, has_resolved, attachments_len)
+        );
+
+        if let Some(ref resolved) = data.resolved {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!("Resolved attachments count: {}", resolved.attachments.len())
+            );
+
+            if let Some(ref opts) = options {
+                for opt in opts {
+                    // Type 11 is ATTACHMENT
+                    if opt.value.is_string() {
+                        let attachment_id = opt.value.as_str().unwrap();
+                        if let Some(discord_att) = resolved.attachments.get(attachment_id) {
+                            attachments.push(near::agent::channel_host::InboundAttachment {
+                                id: discord_att.id.clone(),
+                                mime_type: discord_att
+                                    .mime_type
+                                    .clone()
+                                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                                filename: Some(discord_att.filename.clone()),
+                                size_bytes: Some(discord_att.size),
+                                source_url: Some(discord_att.url.clone()),
+                                storage_key: None,
+                                extracted_text: None,
+                                extras_json: serde_json::json!({
+                                    "width": discord_att.width,
+                                    "height": discord_att.height,
+                                    "proxy_url": discord_att.proxy_url,
+                                })
+                                .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     channel_host::emit_message(&EmittedMessage {
         user_id,
         user_name: Some(user_name),
         content,
         thread_id: None,
         metadata_json,
-        attachments: vec![],
+        attachments,
     });
     true
 }
